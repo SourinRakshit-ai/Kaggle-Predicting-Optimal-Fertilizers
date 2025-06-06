@@ -43,7 +43,7 @@ def calculate_map_at_3(y_true, y_pred_proba):
 
     return ap_sum / num_samples
 
-## Step 1: Load & Preprocess (with Checkpoint)
+## Step 1: Load & Preprocess
 
 preprocessed_path = "X_processed_df_cpu.pkl"
 encoder_path      = "preprocessing_objects_cpu.pkl"  # will store (le, te, poly, numeric_cols, cat_cols, poly_feature_names)
