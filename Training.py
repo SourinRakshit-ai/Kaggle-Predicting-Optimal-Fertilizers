@@ -104,7 +104,7 @@ else:
 sampled_path = "X_sampled_cpu.pkl"
 if not os.path.exists(sampled_path):
     print("▶ Creating stratified subset (200k rows max) for Optuna tuning…")
-    sample_size = 200_000
+    sample_size = 200000
     rng = np.random.RandomState(42)
 
     # Ensure sample_size ≤ total rows
