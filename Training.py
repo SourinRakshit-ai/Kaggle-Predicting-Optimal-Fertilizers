@@ -384,3 +384,40 @@ else:
     joblib.dump(lgb_model,lgb_fn)
 
 print("✅ Trained bagged XGB and full-data LGB")
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Block 7: OOF Predictions & Per‐Class Weighted Blending
+# ──────────────────────────────────────────────────────────────────────────────
+oof_ckpt = base_dir/"oof_probs.pkl"
+if oof_ckpt.exists():
+    oof_xgb, oof_lgb = joblib.load(oof_ckpt)
+else:
+    oof_xgb = np.zeros((len(y), len(le.classes_)))
+    oof_lgb = np.zeros_like(oof_xgb)
+    skf = StratifiedKFold(5,shuffle=True,random_state=42)
+    for ti,vi in tqdm(skf.split(X_num_poly, y), total=5, desc="OOF folds"):
+        # XGB
+        dtr = xgb.DMatrix(X_num_poly.iloc[ti], label=y[ti], weight=weights[ti])
+        dvl = xgb.DMatrix(X_num_poly.iloc[vi], label=y[vi], weight=weights[vi])
+        bst = xgb.train({**xgb_best,"gpu_hist":True}, dtr, bst=xgb_models[0], verbose_eval=False)
+        oof_xgb[vi] = bst.predict(dvl, iteration_range=(0,bst.best_iteration+1))
+        # LGB
+        gbm = lgb_model
+        oof_lgb[vi] = gbm.predict(X_num_poly.iloc[vi],num_iteration=gbm.best_iteration)
+    joblib.dump((oof_xgb,oof_lgb),oof_ckpt)
+
+# 7.1 Per-class weight optimization (simple grid on hold-out)
+hold_preds = np.mean([m.predict(dhold,iteration_range=(0,m.best_iteration+1)) 
+                      for m in xgb_models],0)
+hold_preds_lgb = lgb_model.predict(X_hd,num_iteration=lgb_model.best_iteration)
+best_w = np.ones((len(le.classes_),2)) * 0.5  # init [w_xgb,w_lgb]
+for i in range(len(le.classes_)):
+    best_score=0
+    for wx in np.linspace(0,1,11):
+        wl=1-wx
+        combo = wx*hold_preds[:,i]+wl*hold_preds_lgb[:,i]
+        score = calculate_map_at_3((y_hd==i).astype(int), combo.reshape(-1,1))
+        if score>best_score:
+            best_score, best_w[i] = score, (wx,wl)
+print("✅ Per-class weights (xgb,lgb):\n", best_w)
