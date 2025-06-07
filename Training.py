@@ -1,340 +1,331 @@
-## Importing the Libraries and Loading the dataset
-import os
-import time
-import joblib
-import pandas as pd
-import numpy as np
-import category_encoders as ce
-import xgboost as xgb
-from sklearn.model_selection import StratifiedKFold, train_test_split
-from sklearn.preprocessing import LabelEncoder, PolynomialFeatures
+# ──────────────────────────────────────────────────────────────────────────────
+# Block 1: Imports, Paths & GPU Check
+# ──────────────────────────────────────────────────────────────────────────────
+import os, time, joblib
+from pathlib import Path
+
+# Ensure checkpoint directories exist
+base_dir    = Path("checkpoints");      base_dir.mkdir(exist_ok=True)
+optuna_dir  = base_dir / "optuna";      optuna_dir.mkdir(exist_ok=True)
+models_dir  = base_dir / "models";      models_dir.mkdir(exist_ok=True)
+data_dir    = Path("/kaggle/input/playground-series-s5e6")
+train_csv   = data_dir / "train.csv"
+test_csv    = data_dir / "test.csv"
+sample_csv  = data_dir / "sample_submission.csv"
+
+# GPU check
+import subprocess
+gpu_info = subprocess.run(
+    ["nvidia-smi","--query-gpu=name,compute_cap","--format=csv,noheader"],
+    stdout=subprocess.PIPE, text=True
+).stdout.strip()
+if not gpu_info:
+    raise RuntimeError("No GPU found – switch to a GPU runtime.")
+print("GPU detected:", gpu_info)
+
+# Common imports
+import numpy as np, pandas as pd
+from tqdm import tqdm
+from sklearn.model_selection   import StratifiedKFold, train_test_split
+from sklearn.preprocessing    import LabelEncoder, PolynomialFeatures, StandardScaler
 from sklearn.utils.class_weight import compute_class_weight
-from sklearn.linear_model import LogisticRegression
-from xgboost import callback as xgb_callback
+from sklearn.linear_model     import LogisticRegression
+from category_encoders        import CatBoostEncoder
+import xgboost as xgb
+import lightgbm as lgb
 import optuna
-from optuna.integration import XGBoostPruningCallback
+from optuna.exceptions        import TrialPruned
+from xgboost                   import callback as xgb_callback
 
-# If running in Colab:
-from google.colab import drive
-drive.mount('/content/drive', force_remount=True)
-os.chdir('/content/drive/MyDrive/Fertilizer Prediction')
-print("Working directory:", os.getcwd())
 
-## Defining MAP@3 metric
+# ──────────────────────────────────────────────────────────────────────────────
+# Block 2: MAP@3 & Pruning Callback
+# ──────────────────────────────────────────────────────────────────────────────
 def calculate_map_at_3(y_true, y_pred_proba):
-    """
-    Compute Mean Average Precision @3 for multiclass predictions.
-    """
     ap_sum = 0.0
-    num_samples = len(y_true)
     y_true = np.array(y_true)
-
-    for i in range(num_samples):
-        actual = y_true[i]
-        top3 = np.argsort(y_pred_proba[i])[::-1][:3]
-        score = 0.0
-        num_hits = 0.0
-        for rank, pred_class in enumerate(top3):
-            if pred_class == actual:
-                num_hits += 1.0
-                score += num_hits / (rank + 1.0)
-        if num_hits > 0:
-            ap_sum += score / 1.0
-
-    return ap_sum / num_samples
-
-## Step 1: Load & Preprocess
-
-preprocessed_path = "X_processed_df_cpu.pkl"
-encoder_path      = "preprocessing_objects_cpu.pkl"  # will store (le, te, poly, numeric_cols, cat_cols, poly_feature_names)
-
-if os.path.exists(preprocessed_path) and os.path.exists(encoder_path):
-    print("▶ Loading preprocessed features and preprocessing objects from disk...")
-    X_processed_df, y, weights = joblib.load(preprocessed_path)
-    le, te, poly, numeric_cols, categorical_cols, poly_feature_names = joblib.load(encoder_path)
-    print(f"    ✔ Loaded: X_processed_df.shape = {X_processed_df.shape}")
-else:
-    print("▶ Preprocessing raw data (this may take a moment)…")
-    # 1a) Load raw CSV
-    train_df = pd.read_csv("train.csv")
-    X_raw    = train_df.drop(columns=["id", "Fertilizer Name"])
-    y_raw    = train_df["Fertilizer Name"]
-
-    # 1b) Label-encode the target
-    le = LabelEncoder()
-    y = le.fit_transform(y_raw)
-    print(f"    ✔ Found {len(le.classes_)} fertilizer classes.")
-
-    # 1c) Identify numeric vs. categorical columns
-    numeric_cols     = X_raw.select_dtypes(include=np.number).columns.tolist()
-    categorical_cols = X_raw.select_dtypes(exclude=np.number).columns.tolist()
-    print(f"    Numeric cols: {numeric_cols}")
-    print(f"    Categorical cols: {categorical_cols}")
-
-    # 1d) Target-encode categorical columns (global; note: this leaks labels into features)
-    te = ce.TargetEncoder(cols=categorical_cols)
-    X_cat_te = te.fit_transform(X_raw[categorical_cols], y)
-
-    # 1e) Polynomial interaction features for numeric columns
-    poly = PolynomialFeatures(degree=2, interaction_only=True, include_bias=False)
-    X_num_poly = poly.fit_transform(X_raw[numeric_cols])
-    poly_feature_names = poly.get_feature_names_out(numeric_cols).tolist()
-
-    # 1f) Combine numeric + poly + target-encoded cat into one DataFrame
-    X_numeric = X_raw[numeric_cols].reset_index(drop=True)
-    X_poly    = pd.DataFrame(X_num_poly, columns=poly_feature_names)
-    X_cat_te  = X_cat_te.reset_index(drop=True)
-
-    X_processed_df = pd.concat([X_numeric, X_poly, X_cat_te], axis=1)
-    print(f"    ✔ Processed features shape: {X_processed_df.shape}")
-
-    # 1g) Compute class weights
-    class_weights_array = compute_class_weight("balanced", classes=np.unique(y), y=y)
-    weights = np.array([class_weights_array[label] for label in y])
-    print(f"    ✔ Computed class weights.")
-
-    # 1h) Save preprocessed result + all encoder objects
-    joblib.dump((X_processed_df, y, weights), preprocessed_path)
-    joblib.dump((le, te, poly, numeric_cols, categorical_cols, poly_feature_names), encoder_path)
-    print("    ✔ Saved preprocessing to disk.")
-
-
-## Step 2: SAMPLE A STRATIFIED SUBSET FOR OPTUNA TUNING  
-
-sampled_path = "X_sampled_cpu.pkl"
-if not os.path.exists(sampled_path):
-    print("▶ Creating stratified subset (200k rows max) for Optuna tuning…")
-    sample_size = 200000
-    rng = np.random.RandomState(42)
-
-    # Ensure sample_size ≤ total rows
-    n_total = len(y)
-    if sample_size > n_total:
-        sample_size = n_total
-
-    idx_per_class = []
-    for cls in np.unique(y):
-        cls_idx = np.where(y == cls)[0]
-        n_cls   = len(cls_idx)
-
-        # proportional number for this class
-        n_keep = int(np.round(sample_size * (n_cls / n_total)))
-        n_keep = min(n_keep, n_cls)  # clamp to available samples
-
-        chosen = rng.choice(cls_idx, size=n_keep, replace=False)
-        idx_per_class.append(chosen)
-
-    sample_idx = np.concatenate(idx_per_class)
-    # Adjust if rounding gave too few/many
-    if len(sample_idx) > sample_size:
-        sample_idx = rng.choice(sample_idx, size=sample_size, replace=False)
-    elif len(sample_idx) < sample_size:
-        remaining = np.setdiff1d(np.arange(n_total), sample_idx)
-        extra = rng.choice(remaining, size=(sample_size - len(sample_idx)), replace=False)
-        sample_idx = np.concatenate([sample_idx, extra])
-
-    # Subset data
-    X_sample = X_processed_df.iloc[sample_idx].reset_index(drop=True)
-    y_sample = y[sample_idx]
-    w_sample = weights[sample_idx]
-
-    joblib.dump((X_sample, y_sample, w_sample), sampled_path)
-    print(f"    ✔ Saved sampled subset: {X_sample.shape[0]} rows.")
-else:
-    print("▶ Loading existing sampled subset from disk…")
-    X_sample, y_sample, w_sample = joblib.load(sampled_path)
-    print(f"    ✔ Loaded sampled subset: {X_sample.shape[0]} rows.")
-
-
-## Step 3: Define Custom MAP@3 Pruning Callback
+    for i, probs in enumerate(y_pred_proba):
+        top3 = np.argsort(probs)[::-1][:3]
+        hits = [(1.0/(k+1.0)) for k,p in enumerate(top3) if p==y_true[i]]
+        if hits: ap_sum += hits[0]
+    return ap_sum/len(y_true)
 
 class MAP3PruningCallback(xgb_callback.TrainingCallback):
-    """
-    XGBoost callback that computes MAP@3 on the validation DMatrix each iteration,
-    reports it to Optuna, and prunes if needed.
-    """
     def __init__(self, trial, dval, y_val):
-        self.trial = trial
-        self.dval  = dval
-        self.y_val = y_val
-
+        self.trial, self.dval, self.y_val = trial, dval, y_val
     def after_iteration(self, model, epoch, evals_log):
-        proba     = model.predict(self.dval, iteration_range=(0, epoch + 1))
-        map3_score = calculate_map_at_3(self.y_val, proba)
-        self.trial.report(map3_score, step=epoch)
+        proba = model.predict(self.dval, iteration_range=(0, epoch+1))
+        score = calculate_map_at_3(self.y_val, proba)
+        self.trial.report(score, step=epoch)
         if self.trial.should_prune():
-            raise optuna.exceptions.TrialPruned()
+            raise TrialPruned()
         return False
 
-## Step 4: Optuna Tuning (5-Fold CV on Sample, MAP@3 Pruning)
 
-study_name   = "xgb_cpu_5fold_map3"
-storage_name = f"sqlite:///{study_name}.db"
-study_path   = f"{study_name}_study.pkl"
-N_TRIALS     = 40
+# ──────────────────────────────────────────────────────────────────────────────
+# Block 3: Raw Preprocessing (Ratios + Soil–Crop Embeddings + Polynomial)
+# ──────────────────────────────────────────────────────────────────────────────
+raw_ckpt = base_dir / "raw_preprocessed.pkl"
 
-def objective(trial):
-    params = {
-        "objective":  "multi:softprob",
-        "num_class":  len(le.classes_),
-        "tree_method": "hist",
-        "n_jobs":     -1,
-        "learning_rate": trial.suggest_float("learning_rate", 1e-5, 1e-1, log=True),
-        "max_depth":      trial.suggest_int("max_depth", 3, 20),
-        "min_child_weight": trial.suggest_float("min_child_weight", 1e-5, 10.0, log=True),
-        "gamma":          trial.suggest_float("gamma", 0.0, 5.0),
-        "subsample":      trial.suggest_float("subsample", 0.4, 1.0),
-        "colsample_bytree": trial.suggest_float("colsample_bytree", 0.4, 1.0),
-        "reg_alpha":      trial.suggest_float("reg_alpha", 1e-8, 1.0, log=True),
-        "reg_lambda":     trial.suggest_float("reg_lambda", 1e-8, 1.0, log=True),
-        "max_bin":        trial.suggest_int("max_bin", 256, 2048),
-        "grow_policy":    trial.suggest_categorical("grow_policy", ["depthwise", "lossguide"]),
-        "verbosity":      0,
-        "eval_metric":    "mlogloss"
-    }
+if raw_ckpt.exists():
+    # Load cached preprocessing
+    X_num_poly, y, weights, le, soil_le, crop_le, poly, num_cols = joblib.load(raw_ckpt)
+    print("✅ Loaded raw preprocessing:", X_num_poly.shape)
+else:
+    # 3.1) Read data & label‐encode target
+    df     = pd.read_csv(train_csv)
+    y_raw  = df["Fertilizer Name"].values
+    le     = LabelEncoder().fit(y_raw)
+    y      = le.transform(y_raw)
 
-    skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
-    map3_scores = []
+    # 3.2) Compute nutrient-ratio features
+    df_num = df[["Temparature","Humidity","Moisture","Nitrogen","Potassium","Phosphorous"]].copy()
+    eps    = 1e-6
+    N, P, K = df_num["Nitrogen"], df_num["Phosphorous"], df_num["Potassium"]
+    df_num["N_over_P"]  = N/(P+eps)
+    df_num["N_over_K"]  = N/(K+eps)
+    df_num["P_over_K"]  = P/(K+eps)
+    df_num["total_NPK"] = N+P+K
+    df_num["diff_N_P"]  = N-P
+    df_num["diff_P_K"]  = P-K
 
-    for fold_idx, (train_idx, val_idx) in enumerate(skf.split(X_sample, y_sample)):
-        X_tr = X_sample.iloc[train_idx].values
-        y_tr = y_sample[train_idx]
-        w_tr = w_sample[train_idx]
+    # 3.3) Prepare soil & crop IDs for embeddings
+    soil_le = LabelEncoder().fit(df["Soil Type"])
+    crop_le = LabelEncoder().fit(df["Crop Type"])
+    s_ids   = soil_le.transform(df["Soil Type"]).astype("int32").reshape(-1,1)
+    c_ids   = crop_le.transform(df["Crop Type"]).astype("int32").reshape(-1,1)
+    n_soil, n_crop = len(soil_le.classes_), len(crop_le.classes_)
 
-        X_va = X_sample.iloc[val_idx].values
-        y_va = y_sample[val_idx]
-        w_va = w_sample[val_idx]
+    # 3.4) Build & train tiny Keras embedding model
+    import tensorflow as tf
+    from tensorflow.keras import Input, Model
+    from tensorflow.keras.layers import Embedding, Flatten, Concatenate, Dense, Dropout
+    from tensorflow.keras.utils import to_categorical
+    from tensorflow.keras.callbacks import EarlyStopping
+    tf.random.set_seed(42)
 
-        dtrain = xgb.DMatrix(X_tr, label=y_tr, weight=w_tr)
-        dval   = xgb.DMatrix(X_va, label=y_va, weight=w_va)
+    # One-hot encode target and cast to float32
+    y_cat = to_categorical(y, num_classes=len(le.classes_)).astype("float32")
 
-        callbacks = [
-            xgb_callback.EarlyStopping(rounds=50, save_best=True)
-        ]
-        if fold_idx == 0:
-            callbacks.append(MAP3PruningCallback(trial, dval, y_va))
+    # Define embedding network
+    soil_input = Input(shape=(1,), name="soil_input")
+    crop_input = Input(shape=(1,), name="crop_input")
+    soil_emb   = Flatten()(Embedding(input_dim=n_soil, output_dim=8, name="soil_emb")(soil_input))
+    crop_emb   = Flatten()(Embedding(input_dim=n_crop, output_dim=8, name="crop_emb")(crop_input))
+    x = Concatenate()([soil_emb, crop_emb])
+    x = Dense(32, activation="relu")(x); x = Dropout(0.2)(x)
+    x = Dense(16, activation="relu")(x); x = Dropout(0.2)(x)
+    output = Dense(len(le.classes_), activation="softmax")(x)
 
-        bst = xgb.train(
-            params=params,
-            dtrain=dtrain,
-            num_boost_round=2000,
-            evals=[(dval, "validation")],
-            callbacks=callbacks,
-            verbose_eval=False
-        )
+    emb_model = Model(inputs=[soil_input, crop_input], outputs=output)
+    emb_model.compile(optimizer="adam",
+                      loss="categorical_crossentropy",
+                      metrics=["accuracy"])
 
-        proba_va = bst.predict(dval, iteration_range=(0, bst.best_iteration + 1))
-        map3_scores.append(calculate_map_at_3(y_va, proba_va))
+    # 3.4a) Train on 90/10 split using list inputs
+    from sklearn.model_selection import train_test_split
+    s_tr, s_val, c_tr, c_val, ytr, yval = train_test_split(
+        s_ids, c_ids, y_cat,
+        test_size=0.10,
+        stratify=y,
+        random_state=42
+    )
 
-    return float(np.mean(map3_scores))
+    emb_model.fit(
+        [s_tr, c_tr], ytr,
+        validation_data=([s_val, c_val], yval),
+        epochs=20,
+        batch_size=1024,
+        callbacks=[EarlyStopping("val_loss", patience=3, restore_best_weights=True)],
+        verbose=2
+    )
+
+    # 3.4b) Extract embedding weight matrices
+    soil_emb_weights = emb_model.get_layer("soil_emb").get_weights()[0]  # shape (n_soil,8)
+    crop_emb_weights = emb_model.get_layer("crop_emb").get_weights()[0]  # shape (n_crop,8)
+
+    # 3.5) Map embeddings back to each row
+    soil_feats = soil_emb_weights[s_ids.flatten()]
+    crop_feats = crop_emb_weights[c_ids.flatten()]
+
+    # 3.6) Concatenate numeric+ratio + embeddings
+    df_concat = pd.concat(
+        [df_num.reset_index(drop=True),
+         pd.DataFrame(soil_feats, columns=[f"soil_emb_{i}" for i in range(8)]),
+         pd.DataFrame(crop_feats, columns=[f"crop_emb_{i}" for i in range(8)])],
+        axis=1
+    )
+
+    # 3.7) Polynomial features on all these
+    num_cols = df_concat.columns.tolist()
+    poly     = PolynomialFeatures(degree=2, interaction_only=True, include_bias=False)
+    X_poly   = poly.fit_transform(df_concat.values)
+    poly_cols = poly.get_feature_names_out(num_cols)
+    X_num_poly = pd.DataFrame(X_poly, columns=poly_cols)
+    print("✅ Built polynomial features:", X_num_poly.shape)
+
+    # 3.8) Compute class weights
+    from sklearn.utils.class_weight import compute_class_weight
+    cw = compute_class_weight("balanced", classes=np.unique(y), y=y)
+    weights = cw[y]
+
+    # 3.9) Checkpoint everything needed downstream
+    joblib.dump((X_num_poly, y, weights, le, soil_le, crop_le, poly, num_cols),
+                raw_ckpt)
+    print("✅ Saved raw preprocessing to", raw_ckpt)
 
 
-# 4a) Create or resume the study
-if os.path.exists(f"{study_name}.db"):
-    print("▶ Found existing Optuna DB; resuming study…")
+# ──────────────────────────────────────────────────────────────────────────────
+# Block 4: Create Stratified Subset for Optuna (with tqdm)
+# ──────────────────────────────────────────────────────────────────────────────
+sample_ckpt = base_dir/"sampled.pkl"
+if sample_ckpt.exists():
+    X_s, y_s, w_s = joblib.load(sample_ckpt)
+    print("✅ Loaded subset:", X_s.shape)
+else:
+    print("▶ Sampling 200k rows stratified by class…")
+    idxs = []
+    rng = np.random.RandomState(42)
+    total = len(y)
+    target_size = min(200_000, total)
+    for cls in np.unique(y):
+        cls_idx = np.where(y==cls)[0]
+        keep = int(round(target_size * len(cls_idx)/total))
+        idxs.append(rng.choice(cls_idx, keep, replace=False))
+    idx = np.concatenate(idxs)
+    if len(idx)>target_size:
+        idx = rng.choice(idx, target_size, replace=False)
+    X_s, y_s, w_s = X_num_poly.iloc[idx], y[idx], weights[idx]
+    joblib.dump((X_s,y_s,w_s), sample_ckpt)
+    print("✅ Saved subset:", X_s.shape)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Block 5: Fast Optuna Hyperparameter Tuning (XGB + LGB on GPU)
+# ──────────────────────────────────────────────────────────────────────────────
+
+from optuna.exceptions import TrialPruned
+from lightgbm import Dataset as LGBDataset
+import optuna
+import xgboost as xgb
+from xgboost import callback as xgb_callback
+from sklearn.model_selection import StratifiedKFold
+
+def tune_xgb_fast(train_X, train_y, train_w, n_trials=30):
+    study_file = optuna_dir/"xgb_dart_fast.db"
     study = optuna.create_study(
-        study_name=study_name,
-        storage=storage_name,
+        study_name="xgb_dart_fast",
+        storage=f"sqlite:///{study_file}",
         direction="maximize",
         load_if_exists=True
     )
-else:
-    print("▶ Creating new Optuna study (5-Fold CPU MAP@3)…")
+
+    def objective(trial):
+        params = {
+            "objective":       "multi:softprob",
+            "num_class":       len(le.classes_),
+            "tree_method":     "gpu_hist",
+            "predictor":       "gpu_predictor",
+            "device":          "cuda:0",
+            "booster":         "dart",
+            "learning_rate":   trial.suggest_float("learning_rate", 1e-3, 1e-1, log=True),
+            "max_leaves":      trial.suggest_int("max_leaves", 64, 128),
+            "min_child_weight":trial.suggest_float("min_child_weight", 1e-3, 10, log=True),
+            "subsample":       trial.suggest_float("subsample", 0.6, 1.0),
+            "colsample_bytree":trial.suggest_float("colsample_bytree", 0.6, 1.0),
+            "reg_lambda":      trial.suggest_float("reg_lambda", 1e-4, 1.0, log=True),
+            "eval_metric":     "mlogloss",
+            "verbosity":       0,
+        }
+
+        skf = StratifiedKFold(n_splits=3, shuffle=True, random_state=42)
+        scores = []
+
+        for fold, (ti, vi) in enumerate(skf.split(train_X, train_y)):
+            dtr = xgb.DMatrix(train_X.iloc[ti], train_y[ti], weight=train_w[ti])
+            dvl = xgb.DMatrix(train_X.iloc[vi], train_y[vi], weight=train_w[vi])
+
+            callbacks = [ xgb_callback.EarlyStopping(rounds=10) ]
+            if fold == 0:
+                callbacks.append(MAP3PruningCallback(trial, dvl, train_y[vi]))
+
+            bst = xgb.train(
+                params,
+                dtr,
+                num_boost_round=1000,
+                evals=[(dvl, "val")],
+                callbacks=callbacks,
+                verbose_eval=False
+            )
+
+            preds = bst.predict(dvl, iteration_range=(0, bst.best_iteration + 1))
+            scores.append(calculate_map_at_3(train_y[vi], preds))
+
+        return float(np.mean(scores))
+
+    study.optimize(
+        objective,
+        n_trials=n_trials,
+        catch=(TrialPruned,),
+        show_progress_bar=True
+    )
+    return study.best_trial.params
+
+
+def tune_lgb_fast(train_X, train_y, train_w, n_trials=15):
+    study_file = optuna_dir/"lgb_fast.db"
     study = optuna.create_study(
-        study_name=study_name,
-        storage=storage_name,
+        study_name="lgb_fast",
+        storage=f"sqlite:///{study_file}",
         direction="maximize",
         load_if_exists=True
     )
 
-# 4b) Run only the remaining trials
-completed_trials = len([t for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE])
-if completed_trials < N_TRIALS:
-    to_go = N_TRIALS - completed_trials
-    print(f"▶ Completed {completed_trials}/{N_TRIALS} trials. Running {to_go} more…")
-    try:
-        study.optimize(objective, n_trials=to_go, catch=(optuna.exceptions.TrialPruned,))
-    except KeyboardInterrupt:
-        print("▶ Optimization interrupted by user; partial results saved.")
-else:
-    print(f"▶ Already completed {completed_trials}/{N_TRIALS} trials; skipping optimization.")
+    def objective(trial):
+        params = {
+            "objective":        "multiclass",
+            "num_class":        len(le.classes_),
+            "metric":           "multi_logloss",
+            "device":           "gpu",
+            "learning_rate":    trial.suggest_float("learning_rate", 1e-3, 1e-1, log=True),
+            "num_leaves":       trial.suggest_int("num_leaves", 64, 128),
+            "min_data_in_leaf": trial.suggest_int("min_data_in_leaf", 50, 200),
+            "feature_fraction": trial.suggest_float("feature_fraction", 0.6, 1.0),
+            "bagging_fraction": trial.suggest_float("bagging_fraction", 0.6, 1.0),
+            "verbosity":       -1,
+        }
 
-# 4c) Save updated study and print best trial
-joblib.dump(study, study_path)
-completed_trials = len([t for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE])
-print(f"    ✔ Saved Optuna study to '{study_path}' ({completed_trials}/{N_TRIALS} done).")
+        skf = StratifiedKFold(n_splits=3, shuffle=True, random_state=42)
+        scores = []
 
-best_trial = study.best_trial
-print("=== Best Trial so far ===")
-print(f"  MAP@3 = {best_trial.value:.6f}")
-for key, val in best_trial.params.items():
-    print(f"    • {key}: {val}")
+        for ti, vi in skf.split(train_X, train_y):
+            dtr = LGBDataset(train_X.iloc[ti], train_y[ti], weight=train_w[ti])
+            dvl = LGBDataset(train_X.iloc[vi], train_y[vi], weight=train_w[vi])
 
+            gbm = lgb.train(
+                params,
+                dtr,
+                valid_sets=[dvl],
+                num_boost_round=1000,
+                early_stopping_rounds=10,
+                verbose=False
+            )
 
-## Step 5: Split Full Data Into Train/Hold-out & Save Arrays
+            preds = gbm.predict(train_X.iloc[vi], num_iteration=gbm.best_iteration)
+            scores.append(calculate_map_at_3(train_y[vi], preds))
 
+        return float(np.mean(scores))
 
-arrays_path = "full_split_arrays_cpu.pkl"
-if os.path.exists(arrays_path):
-    print("▶ Loading existing train/hold-out arrays from disk…")
-    X_tr_full, y_tr_full, w_tr_full, X_hold, y_hold, w_hold = joblib.load(arrays_path)
-else:
-    print("▶ Creating train/hold-out split arrays…")
-    X_full = X_processed_df.values
-    y_full = y
-    w_full = weights
-
-    X_tr_full, X_hold, y_tr_full, y_hold, w_tr_full, w_hold = train_test_split(
-        X_full, y_full, w_full,
-        test_size=0.20, random_state=42, stratify=y_full
+    study.optimize(
+        objective,
+        n_trials=n_trials,
+        show_progress_bar=True
     )
-
-    joblib.dump((X_tr_full, y_tr_full, w_tr_full, X_hold, y_hold, w_hold), arrays_path)
-    print(f"    ✔ Saved raw train/hold-out arrays to '{arrays_path}'")
+    return study.best_trial.params
 
 
-## Step 6: Train or Load Ensemble Boosters
-
-ensemble_seeds = [0, 42, 50, 2025] 
-booster_folder  = "boosters_cpu"
-os.makedirs(booster_folder, exist_ok=True)
-
-# Prepare full DMatrix objects
-dtrain_full = xgb.DMatrix(X_tr_full, label=y_tr_full, weight=w_tr_full)
-dhold       = xgb.DMatrix(X_hold,    label=y_hold,    weight=w_hold)
-
-# 6a) Build final_params by merging best_trial.params
-final_params = {
-    "objective":   "multi:softprob",
-    "num_class":   len(le.classes_),
-    "tree_method": "hist",
-    "n_jobs":      -1,
-    "eval_metric": "mlogloss",
-    "verbosity":   1,
-    **best_trial.params
-}
-
-# 6b) Train or load each booster (seeded for an ensemble)
-boosters = []
-for seed in ensemble_seeds:
-    filename = os.path.join(booster_folder, f"best_xgb_cpu_seed{seed}.dill")
-    if os.path.exists(filename):
-        print(f"▶ Loading existing booster: {filename}")
-        bst = joblib.load(filename)
-    else:
-        print(f"▶ Training booster with seed={seed} …")
-        params = final_params.copy()
-        params["random_state"] = seed
-
-        bst = xgb.train(
-            params=params,
-            dtrain=dtrain_full,
-            num_boost_round=3000,
-            evals=[(dhold, "validation")],
-            early_stopping_rounds=50,
-            verbose_eval=False
-        )
-        joblib.dump(bst, filename)
-        print(f"    ✔ Saved booster to '{filename}'")
-    boosters.append(bst)
-print("▶ All boosters ready.")
+# Execute the faster tuning
+xgb_fast_best = tune_xgb_fast(X_s, y_s, w_s, n_trials=20)
+#lgb_fast_best = tune_lgb_fast(X_s, y_s, w_s, n_trials=15)
+print("✅ Fast XGB params:", xgb_fast_best)
+#print("✅ Fast LGB params:", lgb_fast_best)
