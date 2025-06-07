@@ -421,3 +421,77 @@ for i in range(len(le.classes_)):
         if score>best_score:
             best_score, best_w[i] = score, (wx,wl)
 print("✅ Per-class weights (xgb,lgb):\n", best_w)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Block 8: Meta‐Learner Training (LightGBM & XGBoost) with Optuna
+# ──────────────────────────────────────────────────────────────────────────────
+meta_features = np.hstack([oof_xgb, oof_lgb])  # shape (n,2C)
+meta_y = y
+
+# A helper to train either LGB or XGB meta
+def train_meta(model="lgb", n_trials=20):
+    study_file = optuna_dir/f"meta_{model}.db"
+    study = optuna.create_study(
+        study_name=f"meta_{model}", storage=f"sqlite:///{study_file}",
+        direction="maximize", load_if_exists=True
+    )
+    def obj_lgb(trial):
+        params = {
+            "objective":"multiclass","num_class":len(le.classes_),
+            "metric":"multi_logloss","device":"gpu","verbosity":-1,
+            "learning_rate":trial.suggest_float("lr",1e-3,1e-1,log=True),
+            "num_leaves":trial.suggest_int("nl",31,128),
+            "max_depth":trial.suggest_int("md",3,8),
+        }
+        skf=StratifiedKFold(3,shuffle=True,random_state=42)
+        scores=[]
+        for ti,vi in skf.split(meta_features,meta_y):
+            dtr=lgb.Dataset(meta_features[ti],meta_y[ti])
+            dvl=lgb.Dataset(meta_features[vi],meta_y[vi])
+            gbm=lgb.train(params,dtr,1000,valid_sets=[dvl],
+                          early_stopping_rounds=30,verbose=False)
+            preds = gbm.predict(meta_features[vi],num_iteration=gbm.best_iteration)
+            scores.append(calculate_map_at_3(meta_y[vi],preds))
+        return np.mean(scores)
+
+    def obj_xgb(trial):
+        params = {
+            "objective":"multi:softprob","num_class":len(le.classes_),
+            "tree_method":"gpu_hist","gpu_id":0,"verbosity":0,
+            "learning_rate":trial.suggest_float("lr",1e-3,1e-1,log=True),
+            "max_depth":trial.suggest_int("md",3,8)
+        }
+        skf=StratifiedKFold(3,shuffle=True,random_state=42)
+        scores=[]
+        for ti,vi in skf.split(meta_features,meta_y):
+            dtr=xgb.DMatrix(meta_features[ti],label=meta_y[ti])
+            dvl=xgb.DMatrix(meta_features[vi],label=meta_y[vi])
+            bst=xgb.train(params,dtr,1000,evals=[(dvl,"val")],
+                          early_stopping_rounds=30,verbose_eval=False)
+            preds=bst.predict(dvl,iteration_range=(0,bst.best_iteration+1))
+            scores.append(calculate_map_at_3(meta_y[vi],preds))
+        return np.mean(scores)
+
+    if model=="lgb":
+        study.optimize(obj_lgb, n_trials=n_trials, show_progress_bar=True)
+    else:
+        study.optimize(obj_xgb, n_trials=n_trials, show_progress_bar=True)
+
+    best = study.best_trial.params
+    # Final fit on all OOF
+    if model=="lgb":
+        dmeta = lgb.Dataset(meta_features,meta_y)
+        m = lgb.train({**best,"objective":"multiclass","num_class":len(le.classes_)},
+                      dmeta,1000,verbose_eval=False)
+    else:
+        dmeta = xgb.DMatrix(meta_features,meta_y)
+        m = xgb.train({**best,"objective":"multi:softprob","num_class":len(le.classes_),
+                       "tree_method":"gpu_hist","gpu_id":0},
+                      dmeta,1000,verbose_eval=False)
+    joblib.dump((m,best), models_dir/f"meta_{model}.bin")
+    return m
+
+# Train both meta‐models
+meta_lgb = train_meta("lgb", n_trials=15)
+meta_xgb = train_meta("xgb", n_trials=15)
