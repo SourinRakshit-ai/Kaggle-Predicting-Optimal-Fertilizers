@@ -329,3 +329,58 @@ xgb_fast_best = tune_xgb_fast(X_s, y_s, w_s, n_trials=20)
 #lgb_fast_best = tune_lgb_fast(X_s, y_s, w_s, n_trials=15)
 print("✅ Fast XGB params:", xgb_fast_best)
 #print("✅ Fast LGB params:", lgb_fast_best)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Block 6: Full‐Data DMatrix & Final Model Training (Bagged XGB + LGB)
+# ──────────────────────────────────────────────────────────────────────────────
+# 6.1 Train/hold split
+split_ckpt = base_dir/"full_split.pkl"
+if split_ckpt.exists():
+    X_tr, y_tr, w_tr, X_hd, y_hd, w_hd = joblib.load(split_ckpt)
+else:
+    X_tr, X_hd, y_tr, y_hd, w_tr, w_hd = train_test_split(
+      X_num_poly.values, y, weights, test_size=0.2,
+      stratify=y, random_state=42
+    )
+    joblib.dump((X_tr,y_tr,w_tr,X_hd,y_hd,w_hd), split_ckpt)
+
+# 6.2 Build binary DMatrix and save
+dtrain = xgb.DMatrix(X_tr, label=y_tr, weight=w_tr)
+dtrain.save_binary(models_dir/"dtrain.buffer")
+dtrain = xgb.DMatrix(str(models_dir/"dtrain.buffer"))
+
+dhold = xgb.DMatrix(X_hd, label=y_hd, weight=w_hd)
+dhold.save_binary(models_dir/"dhold.buffer")
+dhold = xgb.DMatrix(str(models_dir/"dhold.buffer"))
+
+# 6.3 Bagged XGB (seeds)
+seeds=[0,42,2025,1234]
+xgb_models=[]
+for s in seeds:
+    fn=models_dir/f"xgb_dart_{s}.bin"
+    if fn.exists():
+        xgb_models.append(joblib.load(fn))
+    else:
+        params = {
+            **xgb_best,
+            "objective":"multi:softprob","num_class":len(le.classes_),
+            "tree_method":"gpu_hist","gpu_id":0,"verbosity":0
+        }
+        params.update({"random_state":s})
+        bst=xgb.train(params,dtrain,2000,evals=[(dhold,"val")],
+                      early_stopping_rounds=50,verbose_eval=False)
+        joblib.dump(bst,fn); xgb_models.append(bst)
+
+# 6.4 Final LightGBM on full data
+lgb_fn = models_dir/"lgb_full.bin"
+if lgb_fn.exists():
+    lgb_model = joblib.load(lgb_fn)
+else:
+    lgb_train = lgb.Dataset(X_tr,label=y_tr,weight=w_tr)
+    params = {"device":"gpu", **lgb_best, "objective":"multiclass","num_class":len(le.classes_)}
+    lgb_model = lgb.train(params,lgb_train,2000,valid_sets=[lgb_train],
+                          early_stopping_rounds=50,verbose=False)
+    joblib.dump(lgb_model,lgb_fn)
+
+print("✅ Trained bagged XGB and full-data LGB")
