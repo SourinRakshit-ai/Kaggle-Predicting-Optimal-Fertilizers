@@ -201,21 +201,29 @@ else:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Block 5: Fast Optuna Hyperparameter Tuning (XGB + LGB on GPU)
+# Block 5: Resumable Optuna Tuning (XGB + LGB on GPU) — Fixed Storage Path
 # ──────────────────────────────────────────────────────────────────────────────
 
-from optuna.exceptions import TrialPruned
-from lightgbm import Dataset as LGBDataset
+from pathlib import Path
 import optuna
+from optuna.exceptions import TrialPruned
 import xgboost as xgb
 from xgboost import callback as xgb_callback
+import lightgbm as lgb
+from lightgbm import Dataset as LGBDataset
 from sklearn.model_selection import StratifiedKFold
 
-def tune_xgb_fast(train_X, train_y, train_w, n_trials=30):
-    study_file = optuna_dir/"xgb_dart_fast.db"
+# 5.0) Where to store your studies
+optuna_dir = Path("optuna_studies")
+optuna_dir.mkdir(parents=True, exist_ok=True)  # << create folder if missing
+
+def tune_xgb_resumable(train_X, train_y, train_w, total_trials=30):
+    study_file = optuna_dir / "xgb_dart_resumable.db"
+    # Use THREE slashes for a relative path:
+    storage_url = f"sqlite:///{study_file.as_posix()}"
     study = optuna.create_study(
-        study_name="xgb_dart_fast",
-        storage=f"sqlite:///{study_file}",
+        study_name="xgb_dart_resumable",
+        storage=storage_url,
         direction="maximize",
         load_if_exists=True
     )
@@ -240,19 +248,18 @@ def tune_xgb_fast(train_X, train_y, train_w, n_trials=30):
 
         skf = StratifiedKFold(n_splits=3, shuffle=True, random_state=42)
         scores = []
-
         for fold, (ti, vi) in enumerate(skf.split(train_X, train_y)):
             dtr = xgb.DMatrix(train_X.iloc[ti], train_y[ti], weight=train_w[ti])
             dvl = xgb.DMatrix(train_X.iloc[vi], train_y[vi], weight=train_w[vi])
 
-            callbacks = [ xgb_callback.EarlyStopping(rounds=10) ]
+            callbacks = [xgb_callback.EarlyStopping(rounds=10)]
             if fold == 0:
                 callbacks.append(MAP3PruningCallback(trial, dvl, train_y[vi]))
 
             bst = xgb.train(
                 params,
                 dtr,
-                num_boost_round=1000,
+                num_boost_round=300,
                 evals=[(dvl, "val")],
                 callbacks=callbacks,
                 verbose_eval=False
@@ -263,20 +270,29 @@ def tune_xgb_fast(train_X, train_y, train_w, n_trials=30):
 
         return float(np.mean(scores))
 
-    study.optimize(
-        objective,
-        n_trials=n_trials,
-        catch=(TrialPruned,),
-        show_progress_bar=True
-    )
+    # figure out how many new trials to run
+    completed = len([t for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE])
+    to_run = total_trials - completed
+    if to_run <= 0:
+        print(f"▶ XGB: {completed}/{total_trials} trials already done—skipping.")
+    else:
+        print(f"▶ XGB: resuming {completed}/{total_trials}, running {to_run} more…")
+        study.optimize(
+            objective,
+            n_trials=to_run,
+            catch=(TrialPruned,),
+            show_progress_bar=True
+        )
+
     return study.best_trial.params
 
 
-def tune_lgb_fast(train_X, train_y, train_w, n_trials=15):
-    study_file = optuna_dir/"lgb_fast.db"
+def tune_lgb_resumable(train_X, train_y, train_w, total_trials=20):
+    study_file = optuna_dir / "lgb_resumable.db"
+    storage_url = f"sqlite:///{study_file.as_posix()}"
     study = optuna.create_study(
-        study_name="lgb_fast",
-        storage=f"sqlite:///{study_file}",
+        study_name="lgb_resumable",
+        storage=storage_url,
         direction="maximize",
         load_if_exists=True
     )
@@ -297,7 +313,6 @@ def tune_lgb_fast(train_X, train_y, train_w, n_trials=15):
 
         skf = StratifiedKFold(n_splits=3, shuffle=True, random_state=42)
         scores = []
-
         for ti, vi in skf.split(train_X, train_y):
             dtr = LGBDataset(train_X.iloc[ti], train_y[ti], weight=train_w[ti])
             dvl = LGBDataset(train_X.iloc[vi], train_y[vi], weight=train_w[vi])
@@ -306,7 +321,7 @@ def tune_lgb_fast(train_X, train_y, train_w, n_trials=15):
                 params,
                 dtr,
                 valid_sets=[dvl],
-                num_boost_round=1000,
+                num_boost_round=300,
                 early_stopping_rounds=10,
                 verbose=False
             )
@@ -316,19 +331,27 @@ def tune_lgb_fast(train_X, train_y, train_w, n_trials=15):
 
         return float(np.mean(scores))
 
-    study.optimize(
-        objective,
-        n_trials=n_trials,
-        show_progress_bar=True
-    )
+    completed = len([t for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE])
+    to_run = total_trials - completed
+    if to_run <= 0:
+        print(f"▶ LGB: {completed}/{total_trials} trials already done—skipping.")
+    else:
+        print(f"▶ LGB: resuming {completed}/{total_trials}, running {to_run} more…")
+        study.optimize(
+            objective,
+            n_trials=to_run,
+            show_progress_bar=True
+        )
+
     return study.best_trial.params
 
 
-# Execute the faster tuning
-xgb_fast_best = tune_xgb_fast(X_s, y_s, w_s, n_trials=20)
-#lgb_fast_best = tune_lgb_fast(X_s, y_s, w_s, n_trials=15)
-print("✅ Fast XGB params:", xgb_fast_best)
-#print("✅ Fast LGB params:", lgb_fast_best)
+# ─ Execute tuning ────────────────────────────────────────────────────────────
+
+xgb_best = tune_xgb_resumable(X_s, y_s, w_s, total_trials=30)
+#lgb_best = tune_lgb_resumable(X_s, y_s, w_s, total_trials=20)
+print("✅ Best XGB params:", xgb_best)
+#print("✅ Best LGB params:", lgb_best)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
