@@ -134,8 +134,8 @@ study = optuna.create_study(
 )
 
 completed = len(study.trials)
-if completed < 100:
-    study.optimize(objective, n_trials=100 - completed)
+if completed < 60:
+    study.optimize(objective, n_trials=60 - completed)
     joblib.dump(study, study_pkl)
 
 print("✔ Best MAP@3:", study.best_value)
